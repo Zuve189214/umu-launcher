@@ -1,14 +1,5 @@
 import os
-from enum import Enum
 from pathlib import Path
-
-
-class GamescopeAtom(Enum):
-    """Represent Gamescope-specific X11 atom names."""
-
-    SteamGame = "STEAM_GAME"
-    BaselayerAppId = "GAMESCOPECTRL_BASELAYER_APPID"
-
 
 CONFIG = "umu_version.json"
 
@@ -41,20 +32,19 @@ XDG_CACHE_HOME: Path = (
 # then $XDG_DATA_HOME as fallback, and will be required to update their
 # manifests by adding the permission 'xdg-data/umu:create'.
 # See https://github.com/Open-Wine-Components/umu-launcher/pull/229#discussion_r1799289068
-if os.environ.get("container") == "flatpak":  # noqa: SIM112
-    XDG_DATA_HOME: Path = (
-        Path(os.environ["HOST_XDG_DATA_HOME"])
-        if os.environ.get("HOST_XDG_DATA_HOME")
-        else Path.home().joinpath(".local", "share")
-    )
-elif os.environ.get("SNAP"):
-    XDG_DATA_HOME: Path = Path(os.environ["SNAP_REAL_HOME"])
-else:
-    XDG_DATA_HOME: Path = (
-        Path(os.environ["XDG_DATA_HOME"])
-        if os.environ.get("XDG_DATA_HOME")
-        else Path.home().joinpath(".local", "share")
-    )
+match os.environ.get("container") == "flatpak":  # noqa: SIM112
+    case True:
+        XDG_DATA_HOME: Path = (
+            Path(os.environ["HOST_XDG_DATA_HOME"])
+            if os.environ.get("HOST_XDG_DATA_HOME")
+            else Path.home().joinpath(".local", "share")
+        )
+    case False:
+        XDG_DATA_HOME: Path = (
+            Path(os.environ["XDG_DATA_HOME"])
+            if os.environ.get("XDG_DATA_HOME")
+            else Path.home().joinpath(".local", "share")
+        )
 
 UMU_LOCAL: Path = XDG_DATA_HOME.joinpath("umu")
 

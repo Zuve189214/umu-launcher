@@ -79,7 +79,7 @@ Borderlands 3 from EGS store.
 
 ## Building
 
-Building umu-launcher currently requires `bash`, `make`, and `scdoc` for distribution, as well as the following Python build tools: [build](https://github.com/pypa/build), [hatchling](https://github.com/pypa/hatch), [installer](https://github.com/pypa/installer), and [pip](https://github.com/pypa/pip).
+Building umu-launcher currently requires `bash`, `make`, and `scdoc` for distribution, as well as the following Python build tools: [build](https://github.com/pypa/build), [hatchling](https://github.com/pypa/hatch), and [installer](https://github.com/pypa/installer).
 
 To build umu-launcher, after downloading and extracting the source code from this repository, change into the newly extracted directory
 ```shell
@@ -95,7 +95,7 @@ Change the `--prefix` as fit for your distribution, for example `/usr/local`, or
 Then run `make` to build. After a successful build the resulting files should be available in the `./builddir` directory
 
 
-## Installing
+## Installing 
 
 To install umu-launcher run the following command after completing the steps described above
 ```shell
@@ -130,13 +130,11 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### Nobara
 ```shell
-dnf install umu-launcher
+dnf install -y umu-launcher*.rpm
 ```
 
-### Arch Linux
-```shell
-pacman -S umu-launcher
-```
+### Arch Linux (AUR)
+[![Stable version badge](https://img.shields.io/aur/version/umu-launcher?style=flat&label=umu-launcher)](https://aur.archlinux.org/packages/umu-launcher)
 
 ### NixOS
 If there is any problem with the flake feel free to open a bug report and tag any of the maintainers

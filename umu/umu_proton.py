@@ -1,36 +1,37 @@
 import os
+import sys
 from concurrent.futures import Future, ThreadPoolExecutor
-from hashlib import file_digest, sha512
-from http import HTTPMethod, HTTPStatus
+from hashlib import sha512
+from http.client import HTTPException
+from json import loads
 from pathlib import Path
 from re import split as resplit
 from shutil import move, rmtree
+from ssl import SSLContext, create_default_context
+from tarfile import open as tar_open
 from tempfile import TemporaryDirectory
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from filelock import FileLock
-from urllib3.exceptions import HTTPError
-from urllib3.exceptions import TimeoutError as TimeoutErrorUrllib3
-from urllib3.poolmanager import PoolManager
-from urllib3.response import BaseHTTPResponse
 
 from umu.umu_consts import STEAM_COMPAT, UMU_CACHE, UMU_LOCAL
 from umu.umu_log import log
-from umu.umu_util import extract_tarfile, run_zenity, write_file_chunks
+from umu.umu_util import run_zenity
 
-SessionPools = tuple[ThreadPoolExecutor, PoolManager]
+ssl_default_context: SSLContext = create_default_context()
 
-# Unique subdir in /tmp
-CacheTmpfs = Path
+try:
+    from tarfile import tar_filter
 
-# Unique subdir in $XDG_CACHE_HOME/umu
-CacheSubdir = Path
-
-SessionCaches = tuple[CacheTmpfs, CacheSubdir]
+    has_data_filter: bool = True
+except ImportError:
+    has_data_filter: bool = False
 
 
 def get_umu_proton(
-    env: dict[str, str], session_pools: SessionPools
+    env: dict[str, str], thread_pool: ThreadPoolExecutor
 ) -> dict[str, str]:
     """Attempt to use the latest Proton when configured.
 
@@ -52,19 +53,17 @@ def get_umu_proton(
 
     try:
         log.debug("Sending request to 'api.github.com'...")
-        assets = _fetch_releases(session_pools)
-    except HTTPError:
+        assets = _fetch_releases()
+    except URLError:
         log.debug("Network is unreachable")
 
+    # TODO: Handle interrupts on the move/extract operations
     with (
         TemporaryDirectory() as tmp,
         TemporaryDirectory(dir=UMU_CACHE) as tmpcache,
     ):
-        tmpdirs: SessionCaches = (Path(tmp), Path(tmpcache))
-        if (
-            _get_latest(env, STEAM_COMPAT, tmpdirs, assets, session_pools)
-            is env
-        ):
+        tmpdirs: tuple[Path, Path] = (Path(tmp), Path(tmpcache))
+        if _get_latest(env, STEAM_COMPAT, tmpdirs, assets, thread_pool) is env:
             return env
         if _get_from_steamcompat(env, STEAM_COMPAT) is env:
             return env
@@ -74,15 +73,11 @@ def get_umu_proton(
     return env
 
 
-def _fetch_releases(
-    session_pools: SessionPools,
-) -> tuple[tuple[str, str], tuple[str, str]] | tuple[()]:
+def _fetch_releases() -> tuple[tuple[str, str], tuple[str, str]] | tuple[()]:
     """Fetch the latest releases from the Github API."""
-    resp: BaseHTTPResponse
     digest_asset: tuple[str, str]
     proton_asset: tuple[str, str]
     releases: list[dict[str, Any]]
-    _, http_pool = session_pools
     asset_count: int = 0
     url: str = "https://api.github.com"
     repo: str = "/repos/Open-Wine-Components/umu-proton/releases/latest"
@@ -95,11 +90,14 @@ def _fetch_releases(
     if os.environ.get("PROTONPATH") == "GE-Proton":
         repo = "/repos/GloriousEggroll/proton-ge-custom/releases/latest"
 
-    resp = http_pool.request(HTTPMethod.GET, f"{url}{repo}", headers=headers)
-    if resp.status != HTTPStatus.OK:
-        return ()
+    with urlopen(  # noqa: S310
+        Request(f"{url}{repo}", headers=headers),  # noqa: S310
+        context=ssl_default_context,
+    ) as resp:
+        if resp.status != 200:
+            return ()
+        releases = loads(resp.read().decode("utf-8")).get("assets", [])
 
-    releases = resp.json().get("assets", [])
     for release in releases:
         if release["name"].endswith("sum"):
             digest_asset = (
@@ -117,60 +115,48 @@ def _fetch_releases(
             )
             asset_count += 1
             continue
-        if asset_count == 2:  # noqa: PLR2004
+        if asset_count == 2:
             break
 
-    if asset_count != 2:  # noqa: PLR2004
-        log.warning("Failed to acquire release assets from '%s'", url)
-        log.debug("'%' returned: %s", url, releases)
-        return ()
+    if asset_count != 2:
+        err: str = "Failed to acquire all assets from api.github.com"
+        raise RuntimeError(err)
 
     return digest_asset, proton_asset
 
 
 def _fetch_proton(
     env: dict[str, str],
-    session_caches: SessionCaches,
+    tmp: Path,
     assets: tuple[tuple[str, str], tuple[str, str]],
-    session_pools: SessionPools,
 ) -> dict[str, str]:
     """Download the latest UMU-Proton or GE-Proton."""
-    resp: BaseHTTPResponse
-    tmpfs, cache = session_caches
-    _, http_pool = session_pools
     proton_hash, proton_hash_url = assets[0]
     tarball, tar_url = assets[1]
     proton: str = tarball.removesuffix(".tar.gz")
     ret: int = 0  # Exit code from zenity
     digest: str = ""  # Digest of the Proton archive
-    hashsum = sha512()
 
     # Verify the scheme from Github for resources
-    if not tar_url.startswith("https:") or not proton_hash_url.startswith(
-        "https:"
-    ):
-        err: str = (
-            f"Scheme in URLs is not 'https:': {(tar_url, proton_hash_url)}"
-        )
+    if not tar_url.startswith("https:") or not proton_hash_url.startswith("https:"):
+        err: str = f"Scheme in URLs is not 'https:': {(tar_url, proton_hash_url)}"
         raise ValueError(err)
 
     # Digest file
     # Since the URLs are not hardcoded links, Ruff will flag the urlopen call
     # See https://github.com/astral-sh/ruff/issues/7918
-    log.info("Downloading %s...", proton_hash)
+    log.console(f"Downloading {proton_hash}...")
+    with (urlopen(proton_hash_url, context=ssl_default_context) as resp,):  # noqa: S310
+        if resp.status != 200:
+            err: str = (
+                f"Unable to download {proton_hash}\n"
+                f"github.com returned the status: {resp.status}"
+            )
+            raise HTTPException(err)
 
-    resp = http_pool.request(HTTPMethod.GET, proton_hash_url)
-    if resp.status != HTTPStatus.OK:
-        err: str = (
-            f"Unable to download {proton_hash}\n"
-            f"{resp.getheader('Host')} returned the status: {resp.status}"
-        )
-        raise HTTPError(err)
-
-    # Parse the Proton digest file
-    for line in resp.data.decode(encoding="utf-8").splitlines():
-        if line.endswith(tarball):
-            digest = line.split(" ")[0]
+        for line in resp.read().decode("utf-8").splitlines():
+            if line.endswith(tarball):
+                digest = line.split(" ")[0]
 
     # Proton
     # Create a popup with zenity when the env var is set
@@ -181,77 +167,59 @@ def _fetch_proton(
             "--silent",
             tar_url,
             "--output-dir",
-            str(tmpfs),
+            str(tmp),
         ]
         msg: str = f"Downloading {proton}..."
         ret = run_zenity(curl, opts, msg)
 
     if ret:
-        tmpfs.joinpath(tarball).unlink(missing_ok=True)
+        tmp.joinpath(tarball).unlink(missing_ok=True)
         log.warning("zenity exited with the status code: %s", ret)
-        log.info("Retrying from Python...")
+        log.console("Retrying from Python...")
 
     if not os.environ.get("UMU_ZENITY") or ret:
-        parts: Path = tmpfs.joinpath(f"{tarball}.parts")
-        cached_parts: Path = UMU_CACHE.joinpath(parts.name)
-        headers: dict[str, str] | None = None
+        log.console(f"Downloading {tarball}...")
+        with (urlopen(tar_url, context=ssl_default_context) as resp,):  # noqa: S310
+            hashsum = sha512()
 
-        # Resume from our cached file, if we were interrupted previously
-        if cached_parts.is_file():
-            log.info("Found '%s' in cache, resuming...", cached_parts.name)
-            headers = {"Range": f"bytes={cached_parts.stat().st_size}-"}
-            parts = cached_parts
-            # Rebuild our hashed progress
-            with parts.open("rb") as fp:
-                hashsum = file_digest(fp, hashsum.name)
-        else:
-            log.info("Downloading %s...", tarball)
-
-        resp = http_pool.request(
-            HTTPMethod.GET, tar_url, preload_content=False, headers=headers
-        )
-
-        # Bail out for unexpected status codes
-        if resp.status not in {
-            HTTPStatus.OK,
-            HTTPStatus.PARTIAL_CONTENT,
-            HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
-        }:
-            err: str = (
-                f"{resp.getheader('Host')} returned the status: {resp.status}"
-            )
-            raise HTTPError(err)
-
-        # Only write our file if we're resuming or downloading first time
-        if resp.status != HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE:
-            try:
-                log.debug("Writing: %s", parts)
-                hashsum = write_file_chunks(parts, resp, hashsum)
-            except TimeoutErrorUrllib3:
-                log.error("Aborting Proton install due to network error")
-                log.info(
-                    "Moving '%s' to cache for future resumption", parts.name
+            # Crash here because without Proton, the launcher will not work
+            if resp.status != 200:
+                err: str = (
+                    f"Unable to download {tarball}\n"
+                    f"github.com returned the status: {resp.status}"
                 )
-                log.debug("Moving: %s -> %s", parts, cache.parent)
-                move(parts, cache.parent)
-                raise
+                raise HTTPException(err)
 
-        # Release conn to the pool
-        resp.release_conn()
+            with tmp.joinpath(tarball).open(mode="ab+", buffering=0) as file:
+                chunk_size: int = 64 * 1024  # 64 KB
+                buffer: bytearray = bytearray(chunk_size)
+                view: memoryview = memoryview(buffer)
+                while size := resp.readinto(buffer):
+                    file.write(view[:size])
+                    hashsum.update(view[:size])
 
-        log.debug("Digest: %s", digest)
-        if hashsum.hexdigest() != digest:
-            parts.unlink(missing_ok=True)
-            err: str = (
-                f"Digest mismatched: {tarball}\n"
-                "Possible reason: cached file corrupted or failed to acquire upstream digest\n"
-                f"Link: {tar_url}"
-            )
-            raise ValueError(err)
+            if hashsum.hexdigest() != digest:
+                err: str = f"Digest mismatched: {tarball}"
+                raise ValueError(err)
 
-        log.info("%s: SHA512 is OK", tarball)
+            log.console(f"{tarball}: SHA512 is OK")
 
     return env
+
+
+def _extract_dir(file: Path) -> None:
+    """Extract from a path to another location."""
+    with tar_open(file, "r:gz") as tar:
+        if has_data_filter:
+            log.debug("Using filter for archive")
+            tar.extraction_filter = tar_filter
+        else:
+            log.warning("Python: %s", sys.version)
+            log.warning("Using no data filter for archive")
+            log.warning("Archive will be extracted insecurely")
+        log.console(f"Extracting {file.name}...")
+        log.debug("Source: %s", str(file).removesuffix(".tar.gz"))
+        tar.extractall(path=file.parent)  # noqa: S202
 
 
 def _get_from_steamcompat(
@@ -264,9 +232,7 @@ def _get_from_steamcompat(
     existing Proton build of that same version will be used
     """
     version: str = (
-        "GE-Proton"
-        if os.environ.get("PROTONPATH") == "GE-Proton"
-        else "UMU-Proton"
+        "GE-Proton" if os.environ.get("PROTONPATH") == "GE-Proton" else "UMU-Proton"
     )
 
     try:
@@ -281,8 +247,8 @@ def _get_from_steamcompat(
                 for text in resplit(r"(\d+)", proton.name)
             ],
         )
-        log.info("%s found in '%s'", latest.name, steam_compat)
-        log.info("Using %s", latest.name)
+        log.console(f"{latest.name} found in '{steam_compat}'")
+        log.console(f"Using {latest.name}")
         os.environ["PROTONPATH"] = str(latest)
         env["PROTONPATH"] = os.environ["PROTONPATH"]
     except ValueError:
@@ -294,9 +260,9 @@ def _get_from_steamcompat(
 def _get_latest(
     env: dict[str, str],
     steam_compat: Path,
-    session_caches: SessionCaches,
+    tmpdirs: tuple[Path, Path],
     assets: tuple[tuple[str, str], tuple[str, str]] | tuple[()],
-    session_pools: SessionPools,
+    thread_pool: ThreadPoolExecutor,
 ) -> dict[str, str] | None:
     """Download the latest Proton for new installs.
 
@@ -322,14 +288,12 @@ def _get_latest(
     tarball = assets[1][0]
     proton = tarball.removesuffix(".tar.gz")
     version = (
-        "GE-Proton"
-        if os.environ.get("PROTONPATH") == "GE-Proton"
-        else "UMU-Proton"
+        "GE-Proton" if os.environ.get("PROTONPATH") == "GE-Proton" else "UMU-Proton"
     )
 
     # Return if the latest Proton is already installed
     if steam_compat.joinpath(proton).is_dir():
-        log.info("%s is up to date", version)
+        log.console(f"{version} is up to date")
         steam_compat.joinpath("UMU-Latest").unlink(missing_ok=True)
         steam_compat.joinpath("UMU-Latest").symlink_to(proton)
         os.environ["PROTONPATH"] = str(steam_compat.joinpath(proton))
@@ -347,14 +311,14 @@ def _get_latest(
             raise FileExistsError
 
         # Download the archive to a temporary directory
-        _fetch_proton(env, session_caches, assets, session_pools)
+        _fetch_proton(env, tmpdirs[0], assets)
 
         # Extract the archive then move the directory
-        _install_proton(tarball, session_caches, steam_compat, session_pools)
+        _install_proton(tarball, tmpdirs, steam_compat, thread_pool)
     except (
         ValueError,
         KeyboardInterrupt,
-        HTTPError,
+        HTTPException,
     ) as e:
         log.exception(e)
         return None
@@ -367,7 +331,7 @@ def _get_latest(
     os.environ["PROTONPATH"] = str(steam_compat.joinpath(proton))
     env["PROTONPATH"] = os.environ["PROTONPATH"]
     log.debug("Removing: %s", tarball)
-    log.info("Using %s", proton)
+    log.console(f"Using {proton}")
 
     return env
 
@@ -376,7 +340,11 @@ def _update_proton(
     protons: list[Path],
     thread_pool: ThreadPoolExecutor,
 ) -> None:
-    """Remove previous stable UMU-Proton builds.
+    """Create a symbolic link and remove the previous UMU-Proton.
+
+    The symbolic link will be used by clients to reference the PROTONPATH which
+    can be used for tasks such as killing the running wineserver in the prefix.
+    The link will be recreated each run.
 
     Assumes that the directories that are named ULWGL/UMU-Proton are ours and
     will be removed, so users should not be storing important files there.
@@ -400,9 +368,9 @@ def _update_proton(
 
 def _install_proton(
     tarball: str,
-    session_caches: SessionCaches,
+    tmpdirs: tuple[Path, Path],
     steam_compat: Path,
-    session_pools: SessionPools,
+    thread_pool: ThreadPoolExecutor,
 ) -> None:
     """Install a Proton directory to Steam's compatibilitytools.d.
 
@@ -413,15 +381,12 @@ def _install_proton(
     step, where old builds will be removed in parallel.
     """
     future: Future | None = None
-    tmpfs, cache = session_caches
-    thread_pool, _ = session_pools
-    parts: str = f"{tarball}.parts"
-    cached_parts: Path = cache.parent.joinpath(f"{tarball}.parts")
     version: str = (
-        "GE-Proton"
-        if os.environ.get("PROTONPATH") == "GE-Proton"
-        else "UMU-Proton"
+        "GE-Proton" if os.environ.get("PROTONPATH") == "GE-Proton" else "UMU-Proton"
     )
+    proton: str = tarball.removesuffix(".tar.gz")
+    archive_path: str = f"{tmpdirs[0]}/{tarball}"
+    proton_path: str = f"{tmpdirs[1]}/{proton}"
 
     # TODO: Refactor when differential updates are implemented.
     # Remove all previous builds when the build is UMU-Proton
@@ -433,43 +398,19 @@ def _install_proton(
         ]
         future = thread_pool.submit(_update_proton, protons, thread_pool)
 
-    # Move our file and extract within our cache
-    if cached_parts.is_file():
-        # In this case, arc is already in cache and checksum'd
-        log.debug(
-            "Moving: %s -> %s", cached_parts, cached_parts.with_suffix("")
-        )
-        move(cached_parts, cached_parts.with_suffix(""))
-        # Move the archive to our unique subdir
-        log.debug("Moving: %s -> %s", cached_parts.with_suffix(""), cache)
-        move(cached_parts.with_suffix(""), cache)
-        log.info("Extracting %s...", tarball)
-        # Extract within the subdir
-        extract_tarfile(
-            cache.joinpath(tarball), cache.joinpath(tarball).parent
-        )
-    else:
-        # The archive is in tmpfs. Remove the parts extension
-        move(tmpfs.joinpath(parts), tmpfs.joinpath(tarball))
-        move(tmpfs.joinpath(tarball), cache)
-        log.info("Extracting %s...", tarball)
-        extract_tarfile(
-            cache.joinpath(tarball), cache.joinpath(tarball).parent
-        )
+    # Move downloaded file from tmpfs to cache to avoid high memory usage
+    log.debug("Moving: %s -> %s", archive_path, tmpdirs[1])
+    move(archive_path, tmpdirs[1])
+
+    _extract_dir(tmpdirs[1] / tarball)
 
     # Move decompressed archive to compatibilitytools.d
-    log.info(
-        "%s -> %s",
-        cache.joinpath(tarball.removesuffix(".tar.gz")),
-        steam_compat,
-    )
-    move(cache.joinpath(tarball.removesuffix(".tar.gz")), steam_compat)
+    log.console(f"'{proton_path}' -> '{steam_compat}'")
+    move(proton_path, steam_compat)
 
     steam_compat.joinpath("UMU-Latest").unlink(missing_ok=True)
-    steam_compat.joinpath("UMU-Latest").symlink_to(
-        tarball.removesuffix(".tar.gz")
-    )
-    log.debug("Linking: UMU-Latest -> %s", tarball.removesuffix(".tar.gz"))
+    steam_compat.joinpath("UMU-Latest").symlink_to(proton)
+    log.debug("Linking: UMU-Latest -> %s", proton)
 
     if future:
         future.result()

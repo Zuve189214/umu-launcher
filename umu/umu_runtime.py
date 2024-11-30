@@ -1,42 +1,36 @@
 import os
+import sys
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from hashlib import file_digest, sha256
+from hashlib import sha256
+from http.client import HTTPException, HTTPResponse, HTTPSConnection
 
 try:
     from importlib.resources.abc import Traversable
 except ModuleNotFoundError:
     from importlib.abc import Traversable
 
-from http import HTTPMethod, HTTPStatus
+from json import load
 from pathlib import Path
 from secrets import token_urlsafe
 from shutil import move, rmtree
 from subprocess import run
+from tarfile import open as taropen
 from tempfile import TemporaryDirectory, mkdtemp
+from typing import Any
 
 from filelock import FileLock
-from urllib3.exceptions import HTTPError
-from urllib3.exceptions import TimeoutError as TimeoutErrorUrllib3
-from urllib3.poolmanager import PoolManager
-from urllib3.response import BaseHTTPResponse
 
-from umu.umu_consts import UMU_CACHE, UMU_LOCAL
+from umu.umu_consts import CONFIG, UMU_CACHE, UMU_LOCAL
 from umu.umu_log import log
-from umu.umu_util import (
-    extract_tarfile,
-    has_umu_setup,
-    run_zenity,
-    write_file_chunks,
-)
+from umu.umu_util import find_obsolete, https_connection, run_zenity
 
-Codename = str
+try:
+    from tarfile import tar_filter
 
-Variant = str
-
-RuntimeVersion = tuple[Codename, Variant]
-
-SessionPools = tuple[ThreadPoolExecutor, PoolManager]
+    has_data_filter: bool = True
+except ImportError:
+    has_data_filter: bool = False
 
 
 def create_shim(file_path: Path | None = None):
@@ -53,47 +47,45 @@ def create_shim(file_path: Path | None = None):
     # Set the default path if none is provided
     if file_path is None:
         file_path = UMU_LOCAL.joinpath("umu-shim")
-
     # Define the content of the shell script
-    script_content = (
-        "#!/bin/sh\n"
-        "\n"
-        'if [ "${XDG_CURRENT_DESKTOP}" = "gamescope" ] || [ "${XDG_SESSION_DESKTOP}" = "gamescope" ]; then\n'
-        "    # Check if STEAM_MULTIPLE_XWAYLANDS is set to 1\n"
-        '    if [ "${STEAM_MULTIPLE_XWAYLANDS}" = "1" ]; then\n'
-        '        # Check if DISPLAY is set, if not, set it to ":1"\n'
-        '        if [ -z "${DISPLAY}" ]; then\n'
-        '            export DISPLAY=":1"\n'
-        "        fi\n"
-        "    fi\n"
-        "fi\n"
-        "\n"
-        "# Execute the passed command\n"
-        '"$@"\n'
-        "\n"
-        "# Capture the exit status\n"
-        "status=$?\n"
-        'echo "Command exited with status: $status" >&2\n'
-        "exit $status\n"
-    )
+    script_content = """#!/bin/sh
+
+    if [ "${XDG_CURRENT_DESKTOP}" = "gamescope" ] || [ "${XDG_SESSION_DESKTOP}" = "gamescope" ]; then
+        # Check if STEAM_MULTIPLE_XWAYLANDS is set to 1
+        if [ "${STEAM_MULTIPLE_XWAYLANDS}" = "1" ]; then
+            # Check if DISPLAY is set, if not, set it to ":1"
+            if [ -z "${DISPLAY}" ]; then
+                export DISPLAY=":1"
+            fi
+        fi
+    fi
+
+    # Execute the passed command
+    "$@"
+
+    # Capture the exit status
+    status=$?
+    echo "Command exited with status: $status"
+    exit $status
+    """
 
     # Write the script content to the specified file path
-    with file_path.open("w") as file:
+    with file_path.open('w') as file:
         file.write(script_content)
 
     # Make the script executable
     file_path.chmod(0o700)
 
-
 def _install_umu(
-    runtime_ver: RuntimeVersion,
-    session_pools: SessionPools,
+    json: dict[str, Any],
+    thread_pool: ThreadPoolExecutor,
+    client_session: HTTPSConnection,
 ) -> None:
-    resp: BaseHTTPResponse
+    resp: HTTPResponse
     tmp: Path = Path(mkdtemp())
     ret: int = 0  # Exit code from zenity
-    thread_pool, http_pool = session_pools
-    codename, variant = runtime_ver
+    # Codename for the runtime (e.g., 'sniper')
+    codename: str = json["umu"]["versions"]["runtime_platform"]
     # Archive containing the runtime
     archive: str = f"SteamLinuxRuntime_{codename}.tar.xz"
     base_url: str = (
@@ -101,11 +93,9 @@ def _install_umu(
         "/snapshots/latest-container-runtime-public-beta"
     )
     token: str = f"?versions={token_urlsafe(16)}"
-    host: str = "repo.steampowered.com"
-    parts: Path = tmp.joinpath(f"{archive}.parts")
-    log.debug("Using endpoint '%s' for requests", base_url)
 
-    UMU_CACHE.mkdir(parents=True, exist_ok=True)
+    log.debug("Codename: %s", codename)
+    log.debug("URL: %s", base_url)
 
     # Download the runtime and optionally create a popup with zenity
     if os.environ.get("UMU_ZENITY") == "1":
@@ -124,205 +114,154 @@ def _install_umu(
     # Handle the exit code from zenity
     if ret:
         tmp.joinpath(archive).unlink(missing_ok=True)
-        log.info("Retrying from Python...")
+        log.console("Retrying from Python...")
 
     if not os.environ.get("UMU_ZENITY") or ret:
         digest: str = ""
-        buildid: str = ""
         endpoint: str = (
             f"/steamrt-images-{codename}"
             "/snapshots/latest-container-runtime-public-beta"
         )
         hashsum = sha256()
-        headers: dict[str, str] | None = None
-        cached_parts: Path
 
         # Get the digest for the runtime archive
-        resp = http_pool.request(
-            HTTPMethod.GET, f"{host}{endpoint}/SHA256SUMS{token}"
-        )
-        if resp.status != HTTPStatus.OK:
-            err: str = (
-                f"{resp.getheader('Host')} returned the status: {resp.status}"
-            )
-            raise HTTPError(err)
+        client_session.request("GET", f"{endpoint}/SHA256SUMS{token}")
 
-        # Parse SHA256SUMS
-        for line in resp.data.decode(encoding="utf-8").splitlines():
-            if line.endswith(archive):
-                digest = line.split(" ")[0]
+        with client_session.getresponse() as resp:
+            if resp.status != 200:
+                err: str = f"repo.steampowered.com returned the status: {resp.status}"
+                raise HTTPException(err)
 
-        # Get BUILD_ID.txt. We'll use the value to identify the file when cached.
-        # This will guarantee we'll be picking up the correct file when resuming
-        resp = http_pool.request(
-            HTTPMethod.GET, f"{host}{endpoint}/BUILD_ID.txt{token}"
-        )
-        if resp.status != HTTPStatus.OK:
-            err: str = (
-                f"{resp.getheader('Host')} returned the status: {resp.status}"
-            )
-            raise HTTPError(err)
-
-        buildid = resp.data.decode(encoding="utf-8").strip()
-        log.debug("BUILD_ID: %s", buildid)
-
-        # Extend our variables with the BUILD_ID
-        log.debug(
-            "Renaming: %s -> %s", parts, parts.with_suffix(f".{buildid}.parts")
-        )
-        parts = parts.with_suffix(f".{buildid}.parts")
-        cached_parts = UMU_CACHE.joinpath(f"{archive}.{buildid}.parts")
-
-        # Resume from our cached file, if we were interrupted previously
-        if cached_parts.is_file():
-            log.info("Found '%s' in cache, resuming...", cached_parts.name)
-            headers = {"Range": f"bytes={cached_parts.stat().st_size}-"}
-            parts = cached_parts
-            # Rebuild our hashed progress
-            with parts.open("rb") as fp:
-                hashsum = file_digest(fp, hashsum.name)
-        else:
-            log.info("Downloading %s (latest), please wait...", variant)
-
-        resp = http_pool.request(
-            HTTPMethod.GET,
-            f"{host}{endpoint}/{archive}{token}",
-            preload_content=False,
-            headers=headers,
-        )
-
-        # Bail out for unexpected status codes
-        if resp.status not in {
-            HTTPStatus.OK,
-            HTTPStatus.PARTIAL_CONTENT,
-            HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
-        }:
-            err: str = (
-                f"{resp.getheader('Host')} returned the status: {resp.status}"
-            )
-            raise HTTPError(err)
+            # Parse SHA256SUMS
+            for line in resp.read().decode("utf-8").splitlines():
+                if line.endswith(archive):
+                    digest = line.split(" ")[0]
+                    break
 
         # Download the runtime
-        if resp.status != HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE:
-            try:
-                log.debug("Writing: %s", parts)
-                hashsum = write_file_chunks(parts, resp, hashsum)
-            except TimeoutErrorUrllib3:
-                log.error("Aborting steamrt install due to network error")
-                log.info(
-                    "Moving '%s' to cache for future resumption", parts.name
-                )
-                move(parts, UMU_CACHE)
-                raise
+        log.console(f"Downloading latest steamrt {codename}, please wait...")
+        client_session.request("GET", f"{endpoint}/{archive}{token}")
 
-        # Release conn to the pool
-        resp.release_conn()
+        with (
+            client_session.getresponse() as resp,
+            tmp.joinpath(archive).open(mode="ab+", buffering=0) as file,
+        ):
+            if resp.status != 200:
+                err: str = f"repo.steampowered.com returned the status: {resp.status}"
+                raise HTTPException(err)
 
-        log.debug("Digest: %s", digest)
-        if hashsum.hexdigest() != digest:
-            # Remove our cached file because it had probably got corrupted
-            # somehow since the last launch. Abort the update then continue
-            # to launch using existing runtime
-            cached_parts.unlink(missing_ok=True)
-            err: str = (
-                f"Digest mismatched: {archive}\n"
-                "Possible reason: cached file corrupted or failed to acquire upstream digest\n"
-                f"Link: {host}{endpoint}/{archive}"
-            )
-            raise ValueError(err)
+            chunk_size: int = 64 * 1024  # 64 KB
+            buffer: bytearray = bytearray(chunk_size)
+            view: memoryview = memoryview(buffer)
+            while size := resp.readinto(buffer):
+                file.write(view[:size])
+                hashsum.update(view[:size])
 
-        log.info("%s: SHA256 is OK", archive)
+            # Verify the runtime digest
+            if hashsum.hexdigest() != digest:
+                err: str = f"Digest mismatched: {archive}"
+                raise ValueError(err)
 
-        # Remove the .parts and BUILD_ID suffix
-        parts = parts.rename(
-            parts.parent / parts.name.removesuffix(f".{buildid}.parts")
-        )
+        log.console(f"{archive}: SHA256 is OK")
 
     # Open the tar file and move the files
-    log.debug("Opening: %s", parts)
+    log.debug("Opening: %s", tmp.joinpath(archive))
+
+    UMU_CACHE.mkdir(parents=True, exist_ok=True)
 
     with TemporaryDirectory(dir=UMU_CACHE) as tmpcache:
-        futures: list[Future] = []
-        var: Path = UMU_LOCAL.joinpath("var")
         log.debug("Created: %s", tmpcache)
-        log.debug("Moving: %s -> %s", parts, tmpcache)
-        move(parts, tmpcache)
+        log.debug("Moving: %s -> %s", tmp.joinpath(archive), tmpcache)
+        move(tmp.joinpath(archive), tmpcache)
 
-        # Ensure the target directory exists
-        UMU_LOCAL.mkdir(parents=True, exist_ok=True)
-        log.debug("Extracting: %s -> %s", f"{tmpcache}/{archive}", tmpcache)
-        extract_tarfile(Path(tmpcache, archive), Path(tmpcache))
+        with (taropen(f"{tmpcache}/{archive}", "r:xz") as tar,):
+            futures: list[Future] = []
 
-        # Move the files to the correct location
-        source_dir: Path = Path(tmpcache, f"SteamLinuxRuntime_{codename}")
-        var: Path = UMU_LOCAL.joinpath("var")
-        log.debug("Source: %s", source_dir)
-        log.debug("Destination: %s", UMU_LOCAL)
+            if has_data_filter:
+                log.debug("Using filter for archive")
+                tar.extraction_filter = tar_filter
+            else:
+                log.warning("Python: %s", sys.version)
+                log.warning("Using no data filter for archive")
+                log.warning("Archive will be extracted insecurely")
 
-        # Move each file to the dest dir, overwriting if exists
-        futures.extend(
-            [
-                thread_pool.submit(_move, file, source_dir, UMU_LOCAL)
-                for file in source_dir.glob("*")
-            ]
-        )
+            # Ensure the target directory exists
+            UMU_LOCAL.mkdir(parents=True, exist_ok=True)
 
-        if var.is_dir():
-            log.debug("Removing: %s", var)
-            # Remove the variable directory to avoid Steam Linux Runtime
-            # related errors when creating it. Supposedly, it only happens
-            # when going from umu-launcher 0.1-RC4 -> 1.1.1+
-            # See https://github.com/Open-Wine-Components/umu-launcher/issues/213#issue-2576708738
-            thread_pool.submit(rmtree, str(var))
+            # Extract the entirety of the archive w/ or w/o the data filter
+            log.debug("Extracting: %s -> %s", f"{tmpcache}/{archive}", tmpcache)
+            tar.extractall(path=tmpcache)  # noqa: S202
 
-        for future in futures:
-            future.result()
+            # Move the files to the correct location
+            source_dir: Path = Path(tmpcache, f"SteamLinuxRuntime_{codename}")
+            var: Path = UMU_LOCAL.joinpath("var")
+            log.debug("Source: %s", source_dir)
+            log.debug("Destination: %s", UMU_LOCAL)
+
+            # Move each file to the dest dir, overwriting if exists
+            futures.extend(
+                [
+                    thread_pool.submit(_move, file, source_dir, UMU_LOCAL)
+                    for file in source_dir.glob("*")
+                ]
+            )
+
+            if var.is_dir():
+                log.debug("Removing: %s", var)
+                # Remove the variable directory to avoid Steam Linux Runtime
+                # related errors when creating it. Supposedly, it only happens
+                # when going from umu-launcher 0.1-RC4 -> 1.1.1+
+                # See https://github.com/Open-Wine-Components/umu-launcher/issues/213#issue-2576708738
+                thread_pool.submit(rmtree, str(var))
+
+            for future in futures:
+                future.result()
 
     # Rename _v2-entry-point
     log.debug("Renaming: _v2-entry-point -> umu")
     UMU_LOCAL.joinpath("_v2-entry-point").rename(UMU_LOCAL.joinpath("umu"))
-
     create_shim()
 
     # Validate the runtime after moving the files
-    check_runtime(UMU_LOCAL, runtime_ver)
+    check_runtime(UMU_LOCAL, json)
 
 
-def setup_umu(
-    root: Traversable,
-    local: Path,
-    runtime_ver: RuntimeVersion,
-    session_pools: SessionPools,
-) -> None:
+def setup_umu(root: Traversable, local: Path, thread_pool: ThreadPoolExecutor) -> None:
     """Install or update the runtime for the current user."""
     log.debug("Root: %s", root)
     log.debug("Local: %s", local)
+    json: dict[str, Any] = _get_json(root, CONFIG)
+    host: str = "repo.steampowered.com"
 
     # New install or umu dir is empty
-    if not has_umu_setup(local):
+    if not local.exists() or not any(local.iterdir()):
         log.debug("New install detected")
-        log.info("Setting up Unified Launcher for Windows Games on Linux...")
+        log.console("Setting up Unified Launcher for Windows Games on Linux...")
         local.mkdir(parents=True, exist_ok=True)
-        _restore_umu(
-            local,
-            runtime_ver,
-            session_pools,
-            lambda: local.joinpath("umu").is_file(),
-        )
-        log.info("Using %s (latest)", runtime_ver[1])
+        with https_connection(host) as client_session:
+            _restore_umu(
+                json,
+                thread_pool,
+                lambda: local.joinpath("umu").is_file(),
+                client_session,
+            )
         return
 
     if os.environ.get("UMU_RUNTIME_UPDATE") == "0":
-        log.info("%s updates disabled, skipping", runtime_ver[1])
+        log.debug("Runtime Platform updates disabled")
         return
 
-    _update_umu(local, runtime_ver, session_pools)
+    find_obsolete()
+
+    with https_connection(host) as client_session:
+        _update_umu(local, json, thread_pool, client_session)
 
 
 def _update_umu(
     local: Path,
-    runtime_ver: RuntimeVersion,
-    session_pools: SessionPools,
+    json: dict[str, Any],
+    thread_pool: ThreadPoolExecutor,
+    client_session: HTTPSConnection,
 ) -> None:
     """For existing installations, check for updates to the runtime.
 
@@ -330,51 +269,44 @@ def _update_umu(
     the local VERSIONS.txt against the remote one.
     """
     runtime: Path
-    resp: BaseHTTPResponse
-    _, http_pool = session_pools
-    codename, variant = runtime_ver
+    resp: HTTPResponse
+    codename: str = json["umu"]["versions"]["runtime_platform"]
     endpoint: str = (
-        f"/steamrt-images-{codename}"
-        "/snapshots/latest-container-runtime-public-beta"
+        f"/steamrt-images-{codename}" "/snapshots/latest-container-runtime-public-beta"
     )
-    # Create a token and append it to the URL to avoid the Cloudflare cache
-    # Avoids infinite updates to the runtime each launch
-    # See https://github.com/Open-Wine-Components/umu-launcher/issues/188
     token: str = f"?version={token_urlsafe(16)}"
-    host: str = "repo.steampowered.com"
     log.debug("Existing install detected")
-    log.debug("Using container runtime '%s' aka '%s'", variant, codename)
-    log.debug("Checking updates for '%s'...", variant)
+    log.debug("Sending request to '%s'...", client_session.host)
 
     # Find the runtime directory (e.g., sniper_platform_0.20240530.90143)
-    # Assume the directory begins with the variant
+    # Assume the directory begins with the alias
     try:
-        runtime = max(
-            file for file in local.glob(f"{codename}*") if file.is_dir()
-        )
+        runtime = max(file for file in local.glob(f"{codename}*") if file.is_dir())
     except ValueError:
-        log.critical("*_platform_* directory missing in '%s'", local)
-        log.info("Restoring Runtime Platform...")
+        log.debug("*_platform_* directory missing in '%s'", local)
+        log.warning("Runtime Platform not found")
+        log.console("Restoring Runtime Platform...")
         _restore_umu(
-            local,
-            runtime_ver,
-            session_pools,
-            lambda: len(
-                [file for file in local.glob(f"{codename}*") if file.is_dir()]
-            )
+            json,
+            thread_pool,
+            lambda: len([file for file in local.glob(f"{codename}*") if file.is_dir()])
             > 0,
+            client_session,
         )
         return
 
-    # Restore the runtime when pressure-vessel is missing
+    log.debug("Runtime: %s", runtime.name)
+    log.debug("Codename: %s", codename)
+
     if not local.joinpath("pressure-vessel").is_dir():
-        log.critical("pressure-vessel directory missing in '%s'", local)
-        log.info("Restoring Runtime Platform...")
+        log.debug("pressure-vessel directory missing in '%s'", local)
+        log.warning("Runtime Platform not found")
+        log.console("Restoring Runtime Platform...")
         _restore_umu(
-            local,
-            runtime_ver,
-            session_pools,
+            json,
+            thread_pool,
             lambda: local.joinpath("pressure-vessel").is_dir(),
+            client_session,
         )
         return
 
@@ -382,40 +314,151 @@ def _update_umu(
     # When the file is missing, the request for the image will need to be made
     # to the endpoint of the specific snapshot
     if not local.joinpath("VERSIONS.txt").is_file():
-        log.critical("VERSIONS.txt file missing in '%s'", local)
-        platformid: str | None = _restore_umu_platformid(
-            runtime, runtime_ver, session_pools
-        )
-        if platformid is None:
+        url: str
+        release: Path = runtime.joinpath("files", "lib", "os-release")
+        versions: str = f"SteamLinuxRuntime_{codename}.VERSIONS.txt"
+
+        log.debug("VERSIONS.txt file missing in '%s'", local)
+
+        # Restore the runtime if os-release is missing, otherwise pressure
+        # vessel will crash when creating the variable directory
+        if not release.is_file():
+            log.debug("os-release file missing in '%s'", local)
+            log.warning("Runtime Platform corrupt")
+            log.console("Restoring Runtime Platform...")
             _restore_umu(
-                local,
-                runtime_ver,
-                session_pools,
+                json,
+                thread_pool,
                 lambda: local.joinpath("VERSIONS.txt").is_file(),
+                client_session,
             )
             return
-        local.joinpath("VERSIONS.txt").write_text(platformid)
 
-    # Fetch the version file
-    url: str = (
-        f"{host}{endpoint}/SteamLinuxRuntime_{codename}.VERSIONS.txt{token}"
-    )
-    log.debug("Sending request to '%s' for 'VERSIONS.txt'...", url)
-    resp = http_pool.request(HTTPMethod.GET, url)
-    if resp.status != HTTPStatus.OK:
-        log.error(
-            "%s returned the status: %s", resp.getheader("Host"), resp.status
-        )
-        return
+        # Get the BUILD_ID value in os-release
+        with release.open(mode="r", encoding="utf-8") as file:
+            for line in file:
+                if line.startswith("BUILD_ID"):
+                    # Get the value after 'BUILD_ID=' and strip the quotes
+                    build_id: str = line.removeprefix("BUILD_ID=").rstrip().strip('"')
+                    url = f"/steamrt-images-{codename}" f"/snapshots/{build_id}"
+                    break
 
-    # Update our runtime
-    _update_umu_platform(local, runtime, runtime_ver, session_pools, resp)
+        client_session.request("GET", f"{url}{token}")
 
-    # Restore shim if missing
-    if not local.joinpath("umu-shim").is_file():
+        with client_session.getresponse() as resp:
+            # Handle the redirect
+            if resp.status == 301:
+                location: str = resp.getheader("Location", "")
+                log.debug("Location: %s", resp.getheader("Location"))
+                # The stdlib requires reading the entire response body before
+                # making another request
+                resp.read()
+
+                # Make a request to the new location
+                client_session.request("GET", f"{location}/{versions}{token}")
+                with client_session.getresponse() as resp_redirect:
+                    if resp_redirect.status != 200:
+                        log.warning(
+                            "repo.steampowered.com returned the status: %s",
+                            resp_redirect.status,
+                        )
+                        return
+                    local.joinpath("VERSIONS.txt").write_text(resp.read().decode())
+
+    # Update the runtime if necessary by comparing VERSIONS.txt to the remote
+    # repo.steampowered currently sits behind a Cloudflare proxy, which may
+    # respond with cf-cache-status: HIT in the header for subsequent requests
+    # indicating the response was found in the cache and was returned. Valve
+    # has control over the CDN's cache control behavior, so we must not assume
+    # all of the cache will be purged after new files are uploaded. Therefore,
+    # always avoid the cache by appending a unique query to the URI
+    url: str = f"{endpoint}/SteamLinuxRuntime_{codename}.VERSIONS.txt{token}"
+    client_session.request("GET", url)
+
+    # Attempt to compare the digests
+    with client_session.getresponse() as resp:
+        if resp.status != 200:
+            log.warning("repo.steampowered.com returned the status: %s", resp.status)
+            return
+
+        steamrt_latest_digest: bytes = sha256(resp.read()).digest()
+        steamrt_local_digest: bytes = sha256(
+            local.joinpath("VERSIONS.txt").read_bytes()
+        ).digest()
+        steamrt_versions: Path = local.joinpath("VERSIONS.txt")
+
+        log.debug("Source: %s", url)
+        log.debug("Digest: %s", steamrt_latest_digest)
+        log.debug("Source: %s", steamrt_versions)
+        log.debug("Digest: %s", steamrt_local_digest)
+
+        if steamrt_latest_digest != steamrt_local_digest:
+            lock: FileLock = FileLock(f"{local}/umu.lock")
+            log.console("Updating steamrt to latest...")
+            log.debug("Acquiring file lock '%s'...", lock.lock_file)
+
+            with lock:
+                log.debug("Acquired file lock '%s'", lock.lock_file)
+                # Once another process acquires the lock, check if the latest
+                # runtime has already been downloaded
+                if (
+                    steamrt_latest_digest
+                    == sha256(steamrt_versions.read_bytes()).digest()
+                ):
+                    log.debug("Released file lock '%s'", lock.lock_file)
+                    return
+                _install_umu(json, thread_pool, client_session)
+                log.debug("Removing: %s", runtime)
+                rmtree(str(runtime))
+                log.debug("Released file lock '%s'", lock.lock_file)
+
+    # Restore shim
+    if not local.joinpath("umu-shim").exists():
         create_shim()
 
-    log.info("%s is up to date", variant)
+    log.console("steamrt is up to date")
+
+
+def _get_json(path: Traversable, config: str) -> dict[str, Any]:
+    """Validate the state of the configuration file umu_version.json in a path.
+
+    The configuration file will be used to update the runtime and it reflects
+    the tools currently used by launcher. The key/value pairs umu and versions
+    must exist.
+    """
+    json: dict[str, Any]
+    # Steam Runtime platform values
+    # See https://gitlab.steamos.cloud/steamrt/steamrt/-/wikis/home
+    steamrts: set[str] = {
+        "soldier",
+        "sniper",
+        "medic",
+        "steamrt5",
+    }
+
+    # umu_version.json in the system path should always exist
+    if not path.joinpath(config).is_file():
+        err: str = (
+            f"File not found: {config}\n"
+            "Please reinstall the package to recover configuration file"
+        )
+        raise FileNotFoundError(err)
+
+    with path.joinpath(config).open(mode="r", encoding="utf-8") as file:
+        json = load(file)
+
+    # Raise an error if "umu" and "versions" doesn't exist
+    if not json or "umu" not in json or "versions" not in json["umu"]:
+        err: str = f"Failed to load {config} or 'umu' or 'versions' not in: {config}"
+        raise ValueError(err)
+
+    # The launcher will use the value runtime_platform to glob files. Attempt
+    # to guard against directory removal attacks for non-system wide installs
+    if json["umu"]["versions"]["runtime_platform"] not in steamrts:
+        err: str = "Value for 'runtime_platform' is not a steamrt"
+        raise ValueError(err)
+
+    return json
 
 
 def _move(file: Path, src: Path, dst: Path) -> None:
@@ -437,7 +480,7 @@ def _move(file: Path, src: Path, dst: Path) -> None:
         move(src_file, dest_file)
 
 
-def check_runtime(src: Path, runtime_ver: RuntimeVersion) -> int:
+def check_runtime(src: Path, json: dict[str, Any]) -> int:
     """Validate the file hierarchy of the runtime platform.
 
     The mtree file included in the Steam runtime platform will be used to
@@ -445,26 +488,24 @@ def check_runtime(src: Path, runtime_ver: RuntimeVersion) -> int:
     home directory and used to run games.
     """
     runtime: Path
-    codename, variant = runtime_ver
+    codename: str = json["umu"]["versions"]["runtime_platform"]
     pv_verify: Path = src.joinpath("pressure-vessel", "bin", "pv-verify")
     ret: int = 1
 
     # Find the runtime directory
     try:
-        runtime = max(
-            file for file in src.glob(f"{codename}*") if file.is_dir()
-        )
+        runtime = max(file for file in src.glob(f"{codename}*") if file.is_dir())
     except ValueError:
-        log.critical("%s validation failed", variant)
-        log.critical("Could not find *_platform_* in '%s'", src)
+        log.warning("steamrt validation failed")
+        log.warning("Could not find runtime in '%s'", src)
         return ret
 
     if not pv_verify.is_file():
-        log.warning("%s validation failed", variant)
+        log.warning("steamrt validation failed")
         log.warning("File does not exist: '%s'", pv_verify)
         return ret
 
-    log.info("Verifying integrity of %s...", runtime.name)
+    log.console(f"Verifying integrity of {runtime.name}...")
     ret = run(
         [
             pv_verify,
@@ -476,109 +517,31 @@ def check_runtime(src: Path, runtime_ver: RuntimeVersion) -> int:
     ).returncode
 
     if ret:
-        log.warning("%s validation failed", variant)
+        log.warning("steamrt validation failed")
         log.debug("%s exited with the status code: %s", pv_verify.name, ret)
         return ret
-    log.info("%s: mtree is OK", runtime.name)
+    log.console(f"{runtime.name}: mtree is OK")
+
+    if not UMU_LOCAL.joinpath("umu-shim").exists():
+        create_shim()
 
     return ret
 
 
 def _restore_umu(
-    local: Path,
-    runtime_ver: RuntimeVersion,
-    session_pools: SessionPools,
+    json: dict[str, Any],
+    thread_pool: ThreadPoolExecutor,
     callback_fn: Callable[[], bool],
+    client_session: HTTPSConnection,
 ) -> None:
-    with FileLock(f"{local}/umu.lock") as lock:
+    with FileLock(f"{UMU_LOCAL}/umu.lock") as lock:
         log.debug("Acquired file lock '%s'...", lock.lock_file)
         if callback_fn():
             log.debug("Released file lock '%s'", lock.lock_file)
-            log.info("%s was restored", runtime_ver[1])
+            log.console("steamrt was restored")
             return
-        _install_umu(runtime_ver, session_pools)
+        _install_umu(json, thread_pool, client_session)
         log.debug("Released file lock '%s'", lock.lock_file)
 
-
-def _restore_umu_platformid(
-    runtime_base: Path,
-    runtime_ver: RuntimeVersion,
-    session_pools: SessionPools,
-) -> None | str:
-    url: str = ""
-    _, http_pool = session_pools
-    codename, _ = runtime_ver
-    release: Path = runtime_base.joinpath("files", "lib", "os-release")
-    versions: str = f"SteamLinuxRuntime_{codename}.VERSIONS.txt"
-    host: str = "repo.steampowered.com"
-
-    # Restore the runtime if os-release is missing, otherwise pressure
-    # vessel will crash when creating the variable directory
-    if not release.is_file():
-        log.critical("os-release file missing in *_platform_*")
-        log.critical("Runtime Platform corrupt")
-        log.info("Restoring Runtime Platform...")
-        return None
-
-    # Get the BUILD_ID value in os-release so we can get VERSIONS.txt
-    with release.open(mode="r", encoding="utf-8") as file:
-        for line in file:
-            if line.startswith("BUILD_ID"):
-                # Get the value after 'BUILD_ID=' and strip the quotes
-                build_id: str = (
-                    line.removeprefix("BUILD_ID=").rstrip().strip('"')
-                )
-                url = f"/steamrt-images-{codename}" f"/snapshots/{build_id}"
-                break
-
-    if not url:
-        log.critical("Failed to parse os-release for BUILD_ID in *_platform_*")
-        log.critical("Runtime Platform corrupt")
-        log.info("Restoring Runtime Platform...")
-        return None
-
-    # Make the request to the VERSIONS.txt endpoint. It's fine to hit the
-    # cache for this endpoint, as it differs to the latest-beta endpoint
-    resp = http_pool.request(HTTPMethod.GET, f"{host}{url}{versions}")
-    if resp.status != HTTPStatus.OK:
-        log.error(
-            "%s returned the status: %s",
-            resp.getheader("Host"),
-            resp.status,
-        )
-        return None
-
-    # False positive from mypy.
-    return resp.data.decode(encoding="utf-8")  # type: ignore
-
-
-def _update_umu_platform(
-    local: Path,
-    runtime: Path,
-    runtime_ver: RuntimeVersion,
-    session_pools: SessionPools,
-    resp: BaseHTTPResponse,
-) -> None:
-    _, variant = runtime_ver
-    latest: bytes = sha256(resp.data).digest()
-    current: bytes = sha256(
-        local.joinpath("VERSIONS.txt").read_bytes()
-    ).digest()
-    versions: Path = local.joinpath("VERSIONS.txt")
-    lock: FileLock = FileLock(f"{local}/umu.lock")
-
-    # Compare our version file to upstream's, updating if different
-    if latest != current:
-        log.info("Updating %s to latest...", variant)
-        log.debug("Acquiring file lock '%s'...", lock.lock_file)
-        with lock:
-            log.debug("Acquired file lock '%s'", lock.lock_file)
-            # Once another process acquires the lock, check if the latest
-            # runtime has already been downloaded
-            if latest == sha256(versions.read_bytes()).digest():
-                log.debug("Released file lock '%s'", lock.lock_file)
-                return
-            _install_umu(runtime_ver, session_pools)
-            log.debug("Removing: %s", runtime)
-            rmtree(str(runtime))
-            log.debug("Released file lock '%s'", lock.lock_file)
+    if not UMU_LOCAL.joinpath("umu-shim").exists():
+        create_shim()

@@ -152,8 +152,7 @@ _WINEPREFIX_
 _UMU_LOG_
 	Optional. Enables debug logs for the launcher.
 	
-
-	Set _1_ to enable all logs.
+	Set _1_ to log environment variables, _warning_ for warning messages, or _debug_ to enable all logs.
 
 _STORE_
 	Optional. Can be an arbitrary value or a valid store id in the umu-database.
@@ -168,11 +167,6 @@ _UMU_RUNTIME_UPDATE_
 	Optional. Disables automatic updates to the *Steam Linux Runtime*[6].
 
 	Set _0_ to disable updates.
-
-_UMU_NO_PROTON_
-	Optional. Runs the executable natively within the Steam Linux Runtime. Intended for native Linux games.
-
-	Set _1_ to run the executable natively within the SLR.
 
 # SEE ALSO
 

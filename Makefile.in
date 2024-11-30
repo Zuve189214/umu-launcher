@@ -1,7 +1,8 @@
 PROJECT := umu-launcher
 
 # Define the interpreters to use to prevent shebang complaints
-PYTHON_INTERPRETER = /usr/bin/env python3
+PYTHON_INTERPRETER = /usr/bin/python3
+SHELL_INTERPRETER = /usr/bin/sh
 
 # If this is changed to umu (uppercase), `uninstall` target will also remove the SLR directory
 INSTALLDIR ?= umu
@@ -21,7 +22,7 @@ FLATPAK ?= xfalse
 
 .PHONY: all
 ifeq ($(FLATPAK), xtrue)
-all: umu-dist umu-launcher umu-vendored
+all: umu-dist umu-launcher
 endif
 
 .PHONY: install
@@ -30,9 +31,35 @@ SOURCE_DATE_EPOCH = $(shell LC_ALL=C date --date='@1580601600')
 all: zipapp
 install: zipapp-install
 else
-all: umu-dist umu-docs umu-launcher umu-vendored
-install: umu-install umu-launcher-install umu-vendored-install
+all: umu-dist umu-docs umu-launcher
+install: umu-install umu-launcher-install fix_shebangs
 endif
+
+fix_shebangs:
+	$(info :: Fixing shebangs in $(DESTDIR)... )
+	find $(DESTDIR) -type f -name "*.py" -exec sed -i '1s|^#!/usr/bin/python\b|#!$(PYTHON_INTERPRETER)|' {} \;
+	find $(DESTDIR) -type f -name "*.py" -exec sed -i '1s|^#!/usr/bin/env python\b|#!/usr/bin/env $(PYTHON_INTERPRETER)|' {} \;
+	find $(DESTDIR) -type f -name "*.sh" -exec sed -i '1s|^#!/usr/bin/python\b|#!$(PYTHON_INTERPRETER)|' {} \;
+	find $(DESTDIR) -type f -name "*.sh" -exec sed -i '1s|^#!/usr/bin/env python\b|#!/usr/bin/env $(PYTHON_INTERPRETER)|' {} \;
+	find $(DESTDIR) -type f -name "umu-run" -exec sed -i '1s|^#!/usr/bin/python\b|#!$(PYTHON_INTERPRETER)|' {} \;
+	find $(DESTDIR) -type f -name "umu-run" -exec sed -i '1s|^#!/usr/bin/env python\b|#!/usr/bin/env $(PYTHON_INTERPRETER)|' {} \;
+	find $(DESTDIR) -type f -name "*.sh" -exec sed -i '1s|^#!/usr/bin/env sh|#!$(SHELL_INTERPRETER)|' {} \;
+	find $(DESTDIR) -type f -name "umu-run" -exec sed -i '1s|^#!/usr/bin/env sh|#!$(SHELL_INTERPRETER)|' {} \;
+
+# Special case, do this inside the source directory for release distribution
+umu/umu_version.json: umu/umu_version.json.in
+	$(info :: Updating $(@) )
+	cp $(<) $(<).tmp
+	sed 's|##UMU_VERSION##|$(shell git describe --always --long --tags)|g' -i $(<).tmp
+	mv $(<).tmp $(@)
+
+.PHONY: version
+version: umu/umu_version.json
+
+version-install: version
+	$(info :: Installing umu_version.json )
+	install -d $(DESTDIR)$(PYTHONDIR)/$(INSTALLDIR)
+	install -Dm 644 umu/umu_version.json -t $(DESTDIR)$(PYTHONDIR)/$(INSTALLDIR)
 
 
 $(OBJDIR)/.build-umu-docs: | $(OBJDIR)
@@ -52,7 +79,7 @@ umu-docs-install: umu-docs
 	install -m644 $(OBJDIR)/umu.5 $(DESTDIR)$(MANDIR)/man5/umu.5
 
 
-$(OBJDIR)/.build-umu-dist: | $(OBJDIR)
+$(OBJDIR)/.build-umu-dist: | $(OBJDIR) version
 	$(info :: Building umu )
 	$(PYTHON_INTERPRETER) -m build --wheel --skip-dependency-check --no-isolation --outdir=$(OBJDIR)
 	touch $(@)
@@ -66,15 +93,15 @@ umu-dist-install: umu-dist
 	$(PYTHON_INTERPRETER)  -m installer --destdir=$(DESTDIR) $(OBJDIR)/*.whl
 
 ifeq ($(FLATPAK), xtrue)
-umu-install: umu-dist-install
+umu-install: version-install umu-dist-install
 else
-umu-install: umu-dist-install umu-docs-install
+umu-install: version-install umu-dist-install umu-docs-install
 endif
 
 ifeq ($(FLATPAK), xtrue)
 UMU_LAUNCHER_COMMAND = org.openwinecomponents.umu.umu-launcher
 else
-UMU_LAUNCHER_COMMAND = $(BINDIR)/umu-run
+UMU_LAUNCHER_COMMAND = $(PYTHONDIR)/umu/umu_run.py
 endif
 
 # umu-launcher is separate to allow control over installing the bin target
@@ -99,17 +126,20 @@ umu-launcher-dist-install:
 umu-launcher-install: umu-launcher-dist-install umu-launcher-bin-install
 
 
-$(OBJDIR)/.build-umu-vendored: | $(OBJDIR)
-	$(info :: Building vendored dependencies )
-	python3 -m pip install urllib3 -t $(OBJDIR)
+$(OBJDIR)/.build-umu-subprojects: | $(OBJDIR)
+	$(info :: Building subprojects )
+	pip3 install -r requirements.in -t $(OBJDIR)
 
-.PHONY: umu-vendored
-umu-vendored: $(OBJDIR)/.build-umu-vendored
+.PHONY: umu-subprojects
+umu-subprojects: $(OBJDIR)/.build-umu-subprojects
 
-umu-vendored-install: umu-vendored
+umu-subprojects-install:
 	$(info :: Installing subprojects )
-	install -d $(DESTDIR)$(PYTHONDIR)/umu/_vendor
-	cp      -r $(OBJDIR)/urllib3 $(DESTDIR)$(PYTHONDIR)/umu/_vendor
+	install -d $(DESTDIR)$(PYTHONDIR)
+	cp      -r $(OBJDIR)/*-info     $(DESTDIR)$(PYTHONDIR)
+	cp      -r $(OBJDIR)/Xlib       $(DESTDIR)$(PYTHONDIR)
+	cp      -r $(OBJDIR)/filelock   $(DESTDIR)$(PYTHONDIR)
+	cp         $(OBJDIR)/six.py     $(DESTDIR)$(PYTHONDIR)
 
 $(OBJDIR):
 	@mkdir -p $(@)
@@ -118,7 +148,7 @@ $(OBJDIR):
 .PHONY: clean
 clean:
 	$(info :: Cleaning source directory )
-	@rm -rf -v ./$(RELEASEDIR) $(RELEASEDIR).tar.gz
+	@rm -rf -v $(OBJDIR) umu/umu_version.json ./$(RELEASEDIR) $(RELEASEDIR).tar.gz
 
 
 RELEASEDIR := $(PROJECT)-$(shell git describe --abbrev=0)
@@ -126,7 +156,7 @@ $(RELEASEDIR):
 	mkdir -p $(@)
 
 .PHONY: release
-release: $(RELEASEDIR) | zipapp
+release: $(RELEASEDIR) | version zipapp
 	$(info :: Creating source distribution for release )
 	mkdir -p $(<)
 	rm -rf umu/__pycache__
@@ -147,11 +177,11 @@ ZIPAPP := $(OBJDIR)/umu-run
 ZIPAPP_STAGING := $(OBJDIR)/zipapp_staging
 ZIPAPP_VENV := $(OBJDIR)/zipapp_venv
 
-$(OBJDIR)/.build-zipapp: | $(OBJDIR)
+$(OBJDIR)/.build-zipapp: | $(OBJDIR) version
 	$(info :: Building umu-launcher as zipapp )
 	$(PYTHON_INTERPRETER) -m venv $(ZIPAPP_VENV)
-	. $(ZIPAPP_VENV)/bin/activate && python3 -m pip install -t "$(ZIPAPP_STAGING)" -U --no-compile . truststore
-	rm -r "$(ZIPAPP_STAGING)"/bin
+	. $(ZIPAPP_VENV)/bin/activate && python3 -m pip install -t "$(ZIPAPP_STAGING)" -U --no-compile .
+	install -Dm644 umu/umu_version.json "$(ZIPAPP_STAGING)"/umu/umu_version.json
 	cp umu/__main__.py "$(ZIPAPP_STAGING)"
 	find "$(ZIPAPP_STAGING)" -exec touch -h -d "$(SOURCE_DATE_EPOCH)" {} +
 	. $(ZIPAPP_VENV)/bin/activate && python3 -m zipapp $(ZIPAPP_STAGING) -o $(ZIPAPP) -p "$(PYTHON_INTERPRETER)" -c
@@ -164,7 +194,7 @@ zipapp: $(OBJDIR)/.build-zipapp
 zipapp-install: zipapp
 	$(info :: Installing umu-launcher as zipapp )
 	install -d $(DESTDIR)$(PREFIX)/bin
-	install -Dm755 -p $(ZIPAPP) $(DESTDIR)$(BINDIR)
+	install -Dm755 $(ZIPAPP) $(DESTDIR)$(BINDIR)
 	@echo "Standalone application 'umu-run' created at '$(DESTDIR)$(PREFIX)/bin'"
 
 # vim: ft=make

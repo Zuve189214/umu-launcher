@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: fedora:40
+      image: fedora:latest
 
     steps:
     - name: Install Git
@@ -38,5 +38,5 @@ jobs:
     - name: Fedora-40
       uses: actions/upload-artifact@v4.0.0
       with:
-        name: umu-launcher-rpm-40
+        name: umu-launcher-rpm
         path: ~/rpmbuild/RPMS/noarch/*.rpm
